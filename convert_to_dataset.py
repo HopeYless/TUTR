@@ -1,291 +1,129 @@
 """
-Convert robot pose and obstacle tracking JSON files to TUTR pkl dataset format.
+Convert raw JSON trajectory data to .pkl files for TUTR training and testing.
 
-Reads:
-  raw_data/Apr. 12 2026 twoPeople/bed_pose_history.json
-  raw_data/Apr. 12 2026 twoPeople/obstacles_history_edited.json
+Input:
+  raw_data/Apr. 12 2026 twoPeople/bed_pose_history.json      -> Robot (index 0)
+  raw_data/Apr. 12 2026 twoPeople/obstacles_history_edited.json -> Obstacles (indices 1, 2)
 
-Writes (by default):
+Output:
   dataset/twoPeople_train.pkl
   dataset/twoPeople_test.pkl
 
-Usage:
-  python convert_to_dataset.py
-  python convert_to_dataset.py --stride 4 --obs_len 8 --pred_len 12
-  python convert_to_dataset.py --train_ratio 0 --dataset_name twoPeople_test_only
-  python convert_to_dataset.py --no_robot   # exclude the robot; predict only people
-
-Data format produced (matches dataset.py TrajectoryDataset):
-  Each scenario is a 3-tuple (hist, future, neighbor):
-    hist     np.float32  [obs_len, 2]            observed x,y of the focal agent
-    future   np.float32  [pred_len, 2]            ground-truth future x,y
-    neighbor np.float32  [obs_len+pred_len, N, 2] all other agents, time-first
-
-The raw data is collected at ~10 Hz.  The default stride of 4 down-samples to
-~2.5 Hz, giving observation windows of ~3.2 s and prediction horizons of ~4.8 s
-– comparable to the ETH/UCY benchmark conventions used by TUTR.
+Each pkl is a list of (hist, future, neighbor) tuples:
+  hist     : np.float32 (OBS_LEN, 6)            [x, y, vx, vy, ax, ay]
+  future   : np.float32 (PRED_LEN, 2)           [x, y]
+  neighbor : np.float32 (OBS_LEN+PRED_LEN, N-1, 6)
 """
 
 import json
-import pickle
 import numpy as np
+import pickle
 import os
-import argparse
-from pathlib import Path
 
+# ── Parameters ────────────────────────────────────────────────────────────────
+OBS_LEN    = 8
+PRED_LEN   = 12
+HORIZON    = OBS_LEN + PRED_LEN          # 20 frames per window
+DATA_DIM   = 6                            # x, y, vx, vy, ax, ay
 
-# ---------------------------------------------------------------------------
-# I/O helpers
-# ---------------------------------------------------------------------------
+RAW_DIR   = "raw_data/Apr. 12 2026 twoPeople"
+ROBOT_FILE = os.path.join(RAW_DIR, "bed_pose_history.json")
+OBS_FILE   = os.path.join(RAW_DIR, "obstacles_history_edited.json")
+OUT_DIR    = "dataset"
 
-def load_json_files(robot_path: Path, obstacles_path: Path):
-    with open(robot_path) as f:
-        robot_data = json.load(f)
-    with open(obstacles_path) as f:
-        obstacles_data = json.load(f)
-    return robot_data, obstacles_data
+# ── Load JSON ─────────────────────────────────────────────────────────────────
+with open(ROBOT_FILE) as f:
+    robot_data = json.load(f)
 
+with open(OBS_FILE) as f:
+    obs_data = json.load(f)
 
-def build_agent_arrays(robot_data, obstacles_data, include_robot: bool = True):
-    """
-    Align all agents on the shared timestamp grid and return x,y arrays.
+# Two obstacle track IDs (sorted for reproducibility)
+obs_ids = sorted(obs_data.keys())          # ['433', '496']
+assert len(obs_ids) == 2, f"Expected 2 obstacles, got {len(obs_ids)}: {obs_ids}"
 
-    All three sources (robot, track 496, track 433) were recorded at the same
-    timestamps, so no interpolation is needed.
+n_frames = len(robot_data)
+for oid in obs_ids:
+    assert len(obs_data[oid]) == n_frames, \
+        f"Obstacle {oid} has {len(obs_data[oid])} frames, expected {n_frames}"
 
-    Returns
-    -------
-    times  : np.ndarray  shape [T]       Unix timestamps
-    agents : dict        agent_id -> np.ndarray shape [T, 2]  (x, y)
-    """
-    times = np.array([e["time"] for e in robot_data], dtype=np.float64)
-    agents = {}
+print(f"Frames       : {n_frames}")
+print(f"Agents       : robot (0), obstacle {obs_ids[0]} (1), obstacle {obs_ids[1]} (2)")
+print(f"Horizon      : obs={OBS_LEN}  pred={PRED_LEN}  total={HORIZON}")
 
-    if include_robot:
-        agents["robot"] = np.array(
-            [[e["position"]["x"], e["position"]["y"]] for e in robot_data],
-            dtype=np.float32,
-        )
+# ── Extract positions (n_frames, 3, 2) ────────────────────────────────────────
+#   Agent 0 = robot
+#   Agent 1 = obstacle obs_ids[0]  (first by sorted track id)
+#   Agent 2 = obstacle obs_ids[1]
+positions = np.zeros((n_frames, 3, 2), dtype=np.float64)
 
-    for track_id, track_entries in obstacles_data.items():
-        agents[track_id] = np.array(
-            [[e["position"]["x"], e["position"]["y"]] for e in track_entries],
-            dtype=np.float32,
-        )
+for i, entry in enumerate(robot_data):
+    positions[i, 0, 0] = entry["position"]["x"]
+    positions[i, 0, 1] = entry["position"]["y"]
 
-    return times, agents
+for agent_col, oid in enumerate(obs_ids, start=1):
+    for i, entry in enumerate(obs_data[oid]):
+        positions[i, agent_col, 0] = entry["position"]["x"]
+        positions[i, agent_col, 1] = entry["position"]["y"]
 
+# ── Build state matrix (n_frames, 3, 6): [x, y, vx, vy, ax, ay] ──────────────
+# Velocity  : backward difference  v[t] = pos[t] - pos[t-1]
+#             first frame copies from frame 1 (matching dataloader.py behaviour)
+# Acceleration: backward difference  a[t] = v[t] - v[t-1]
+#             first frame copies from frame 1
 
-# ---------------------------------------------------------------------------
-# Sequence builder
-# ---------------------------------------------------------------------------
+states = np.zeros((n_frames, 3, DATA_DIM), dtype=np.float32)
+states[:, :, :2] = positions.astype(np.float32)
 
-def create_scenarios(agents, obs_len: int, pred_len: int, stride: int):
-    """
-    Build sliding-window (hist, future, neighbor) tuples from aligned arrays.
+vel = np.zeros((n_frames, 3, 2), dtype=np.float32)
+vel[1:] = positions[1:] - positions[:-1]   # backward diff
+vel[0]  = vel[1]                            # first frame inherits from frame 1
+states[:, :, 2:4] = vel
 
-    Parameters
-    ----------
-    agents  : dict  agent_id -> np.ndarray [T, 2]
-    obs_len : int   number of observation frames (after subsampling)
-    pred_len: int   number of prediction frames (after subsampling)
-    stride  : int   subsampling step over the raw 10-Hz frames
+acc = np.zeros((n_frames, 3, 2), dtype=np.float32)
+acc[1:] = vel[1:] - vel[:-1]
+acc[0]  = acc[1]
+states[:, :, 4:6] = acc
 
-    Returns
-    -------
-    list of (hist, future, neighbor) triples
-    """
-    total_len = obs_len + pred_len
-    agent_ids = list(agents.keys())
-    T_raw = next(iter(agents.values())).shape[0]
+# ── Create sliding-window trajectory items ────────────────────────────────────
+def make_items(frame_start: int, frame_end: int) -> list:
+    """Return list of (hist, future, neighbor) for frames [frame_start, frame_end)."""
+    items = []
+    n_agents = states.shape[1]
+    for t in range(frame_start, frame_end - HORIZON + 1):
+        window = states[t : t + HORIZON]           # (HORIZON, 3, 6)
+        for agent_i in range(n_agents):
+            hist   = window[:OBS_LEN,  agent_i].copy()          # (8, 6)
+            future = window[OBS_LEN:,  agent_i, :2].copy()      # (12, 2)
+            nbr_idx = [j for j in range(n_agents) if j != agent_i]
+            neighbor = window[:, nbr_idx].copy()                 # (20, 2, 6)
+            items.append((
+                hist.astype(np.float32),
+                future.astype(np.float32),
+                neighbor.astype(np.float32),
+            ))
+    return items
 
-    # Subsampled frame indices into the raw arrays
-    sub_indices = list(range(0, T_raw, stride))
+all_items = make_items(0, n_frames)
 
-    if len(sub_indices) < total_len:
-        raise ValueError(
-            f"Not enough subsampled frames ({len(sub_indices)}) for a single "
-            f"window of length {total_len}.  Reduce --stride or --obs_len/--pred_len."
-        )
+print(f"Frames : 0-{n_frames-1}  ->  {len(all_items)} trajectory items")
 
-    scenarios = []
-    n_windows = len(sub_indices) - total_len + 1
+# ── Save ──────────────────────────────────────────────────────────────────────
+os.makedirs(OUT_DIR, exist_ok=True)
 
-    for w in range(n_windows):
-        raw_idx = sub_indices[w : w + total_len]  # length total_len
+test_path = os.path.join(OUT_DIR, "twoPeople_test.pkl")
 
-        for ped_id in agent_ids:
-            ped_xy = agents[ped_id][raw_idx]          # [total_len, 2]
-            hist   = ped_xy[:obs_len]                 # [obs_len,   2]
-            future = ped_xy[obs_len:]                 # [pred_len,  2]
+with open(test_path, "wb") as f:
+    pickle.dump(all_items, f)
 
-            other_ids = [aid for aid in agent_ids if aid != ped_id]
-            if other_ids:
-                # Stack along axis-1 to produce [total_len, N, 2]  (time-first)
-                neighbor = np.stack(
-                    [agents[nid][raw_idx] for nid in other_ids], axis=1
-                )
-            else:
-                # No real neighbours; fill with sentinel so distance filter drops it
-                neighbor = np.full((total_len, 1, 2), 1e9, dtype=np.float32)
+print(f"\nSaved: {test_path}")
 
-            scenarios.append(
-                (
-                    hist.astype(np.float32),
-                    future.astype(np.float32),
-                    neighbor.astype(np.float32),
-                )
-            )
-
-    return scenarios, n_windows
-
-
-# ---------------------------------------------------------------------------
-# Train / test split  (temporal – no window leakage between splits)
-# ---------------------------------------------------------------------------
-
-def temporal_split(scenarios, n_windows: int, n_agents: int, train_ratio: float):
-    """
-    Split scenarios into train and test preserving temporal order.
-
-    Scenarios are laid out as:
-        window_0/agent_0, window_0/agent_1, ...,
-        window_1/agent_0, ...
-    The first `train_ratio` fraction of windows go to train, the rest to test.
-    """
-    train_cut = int(n_windows * train_ratio)
-    train, test = [], []
-    for i, s in enumerate(scenarios):
-        window_idx = i // n_agents
-        if window_idx < train_cut:
-            train.append(s)
-        else:
-            test.append(s)
-    return train, test
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-def main():
-    script_dir = Path(__file__).parent
-
-    parser = argparse.ArgumentParser(
-        description="Convert robot/obstacle JSON data to TUTR pkl dataset format."
-    )
-    parser.add_argument(
-        "--robot_json",
-        default="raw_data/Apr. 12 2026 twoPeople/bed_pose_history.json",
-        help="Path to robot pose JSON (relative to repo root or absolute)",
-    )
-    parser.add_argument(
-        "--obstacles_json",
-        default="raw_data/Apr. 12 2026 twoPeople/obstacles_history_edited.json",
-        help="Path to obstacles JSON (relative to repo root or absolute)",
-    )
-    parser.add_argument(
-        "--obs_len", type=int, default=8,
-        help="Observation length in subsampled frames (default: 8)",
-    )
-    parser.add_argument(
-        "--pred_len", type=int, default=12,
-        help="Prediction length in subsampled frames (default: 12)",
-    )
-    parser.add_argument(
-        "--stride", type=int, default=4,
-        help=(
-            "Subsampling stride over raw 10-Hz frames. "
-            "stride=4 → ~2.5 Hz, matching ETH/UCY conventions (default: 4)"
-        ),
-    )
-    parser.add_argument(
-        "--train_ratio", type=float, default=0.7,
-        help=(
-            "Fraction of windows used for the train split (0–1). "
-            "Use 0 to write only a test file (default: 0.7)"
-        ),
-    )
-    parser.add_argument(
-        "--output_dir", default="./dataset",
-        help="Directory to write pkl files (default: ./dataset)",
-    )
-    parser.add_argument(
-        "--dataset_name", default="twoPeople",
-        help="Base name for output files: <name>_train.pkl / <name>_test.pkl",
-    )
-    parser.add_argument(
-        "--no_robot", action="store_true",
-        help="Exclude the robot from the agent set; predict only the tracked people",
-    )
-    args = parser.parse_args()
-
-    # Resolve input paths
-    robot_path     = Path(args.robot_json)
-    obstacles_path = Path(args.obstacles_json)
-    if not robot_path.is_absolute():
-        robot_path = script_dir / robot_path
-    if not obstacles_path.is_absolute():
-        obstacles_path = script_dir / obstacles_path
-
-    print(f"Loading  robot      : {robot_path}")
-    print(f"Loading  obstacles  : {obstacles_path}")
-
-    robot_data, obstacles_data = load_json_files(robot_path, obstacles_path)
-    times, agents = build_agent_arrays(
-        robot_data, obstacles_data, include_robot=not args.no_robot
-    )
-
-    T_raw = next(iter(agents.values())).shape[0]
-    n_sub = len(range(0, T_raw, args.stride))
-    hz    = 1.0 / (0.1 * args.stride)
-
-    print(f"\nAgents            : {list(agents.keys())}")
-    print(f"Raw frames        : {T_raw}  (~10 Hz,  {times[-1]-times[0]:.1f} s)")
-    print(f"Subsampled frames : {n_sub}  (~{hz:.1f} Hz,  stride={args.stride})")
-    print(f"Window length     : {args.obs_len + args.pred_len} frames  "
-          f"(obs={args.obs_len}, pred={args.pred_len})")
-
-    scenarios, n_windows = create_scenarios(
-        agents, args.obs_len, args.pred_len, args.stride
-    )
-
-    n_agents = len(agents)
-    print(f"Windows           : {n_windows}")
-    print(f"Total scenarios   : {len(scenarios)}  ({n_windows} windows × {n_agents} agents)")
-
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    if args.train_ratio > 0:
-        train_scenarios, test_scenarios = temporal_split(
-            scenarios, n_windows, n_agents, args.train_ratio
-        )
-
-        train_path = os.path.join(args.output_dir, f"{args.dataset_name}_train.pkl")
-        test_path  = os.path.join(args.output_dir, f"{args.dataset_name}_test.pkl")
-
-        with open(train_path, "wb") as f:
-            pickle.dump(train_scenarios, f)
-        print(f"\nSaved {len(train_scenarios):4d} train scenarios -> {train_path}")
-
-        with open(test_path, "wb") as f:
-            pickle.dump(test_scenarios, f)
-        print(f"Saved {len(test_scenarios):4d} test  scenarios -> {test_path}")
-    else:
-        test_path = os.path.join(args.output_dir, f"{args.dataset_name}_test.pkl")
-        with open(test_path, "wb") as f:
-            pickle.dump(scenarios, f)
-        print(f"\nSaved {len(scenarios)} test scenarios -> {test_path}")
-
-    # Quick sanity check on the first scenario
-    s0 = scenarios[0]
-    print(
-        f"\nSanity check (first scenario):\n"
-        f"  hist     shape: {s0[0].shape}   dtype: {s0[0].dtype}\n"
-        f"  future   shape: {s0[1].shape}   dtype: {s0[1].dtype}\n"
-        f"  neighbor shape: {s0[2].shape}   dtype: {s0[2].dtype}"
-    )
-
-
-if __name__ == "__main__":
-    main()
+# ── Quick sanity check ────────────────────────────────────────────────────────
+print("\n-- Sanity check (first item) --")
+h, fut, nbr = all_items[0]
+print(f"  hist     shape : {h.shape}   dtype: {h.dtype}")
+print(f"  future   shape : {fut.shape}  dtype: {fut.dtype}")
+print(f"  neighbor shape : {nbr.shape}  dtype: {nbr.dtype}")
+print(f"  hist  x,y  (first frame) : {h[0, :2]}")
+print(f"  future x,y (first step)  : {fut[0]}")
+print(f"  neighbor 0 x,y (t=0)     : {nbr[0, 0, :2]}")

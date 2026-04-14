@@ -23,7 +23,7 @@ parser.add_argument('--dataset_path', type=str, default='./dataset/')
 parser.add_argument('--dataset_name', type=str, default='sdd')
 parser.add_argument("--hp_config", type=str, default=None, help='hyper-parameter')
 parser.add_argument('--lr_scaling', action='store_true', default=False)
-parser.add_argument('--num_works', type=int, default=8)
+parser.add_argument('--num_works', type=int, default=0)
 parser.add_argument('--obs_len', type=int, default=8)
 parser.add_argument('--pred_len', type=int, default=12)
 parser.add_argument('--seed', type=int, default=1)
@@ -31,6 +31,8 @@ parser.add_argument('--gpu', type=str, default='0')
 parser.add_argument('--data_scaling', type=list, default=[1.9, 0.4])
 parser.add_argument('--dist_threshold', type=float, default=2)
 parser.add_argument('--checkpoint', type=str, default='./checkpoint/')
+parser.add_argument('--patience', type=int, default=20,
+                    help='Early stopping: stop if ADE+FDE does not improve for this many epochs')
 
 args = parser.parse_args()
 seed = args.seed
@@ -242,6 +244,8 @@ def test(model, test_dataloader, motion_modes):
 
 min_ade = 99
 min_fde = 99
+epochs_no_improve = 0
+min_fde_epoch = 0
 
 for ep in range(hp_config.epoch):
 
@@ -257,10 +261,17 @@ for ep in range(hp_config.epoch):
         min_fde = fde
         min_ade = ade
         min_fde_epoch = ep
-        torch.save(model.state_dict(), args.checkpoint + args.dataset_name + '/best.pth')  # OK
+        epochs_no_improve = 0
+        torch.save(model.state_dict(), args.checkpoint + args.dataset_name + '/best.pth')
+    else:
+        epochs_no_improve += 1
 
     train_loss = sum(total_loss) / len(total_loss)
 
     print('epoch:', ep, 'data_set:', args.dataset_name, 'total_loss:', train_loss)
     print('epoch:', ep, 'ade:', ade, 'fde:', fde, 'min_ade:', min_ade, 'min_fde:', min_fde, 'num_traj:', num_traj,
           "min_fde_epoch:", min_fde_epoch)
+
+    if args.patience > 0 and epochs_no_improve >= args.patience:
+        print(f'Early stopping at epoch {ep}: no improvement for {args.patience} epochs.')
+        break
