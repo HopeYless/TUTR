@@ -59,7 +59,7 @@ parser.add_argument("--n_agents",         type=int, default=3,
                          "Scenarios are laid out as window_0/agent_0, window_0/agent_1, ... "
                          "Agent index 0 = Robot, index 1 = Obstacle 1, index 2 = Obstacle 2. (default: 3)")
 parser.add_argument("--dataset_type",     type=str, default="test",
-                    choices=["test", "train"],
+                    choices=["test", "train", "all"],
                     help="Which split to visualise: 'test' or 'train' (default: test)")
 args = parser.parse_args()
 

@@ -2,8 +2,8 @@
 Convert raw JSON trajectory data to .pkl files for TUTR training and testing.
 
 Input:
-  raw_data/Apr. 14 2026 twoPeople/bed_pose_history.json      -> Robot (index 0)
-  raw_data/Apr. 14 2026 twoPeople/obstacles_history_edited.json -> Obstacles (indices 1, 2)
+  raw_data/Apr. 12 2026 twoPeople/bed_pose_history.json      -> Robot (index 0)
+  raw_data/Apr. 12 2026 twoPeople/obstacles_history_edited.json -> Obstacles (indices 1, 2)
 
 Output:
   dataset/twoPeople_train.pkl
@@ -26,11 +26,10 @@ PRED_LEN   = 12
 HORIZON    = OBS_LEN + PRED_LEN          # 20 frames per window
 DATA_DIM   = 6                            # x, y, vx, vy, ax, ay
 
-RAW_DIR   = "raw_data/Apr. 12 2026 twoPeople"
+RAW_DIR   = "raw_data/Apr. 14 2026 twoPeople"
 ROBOT_FILE = os.path.join(RAW_DIR, "bed_pose_history.json")
 OBS_FILE   = os.path.join(RAW_DIR, "obstacles_history_edited.json")
-OUT_DIR    = "dataset_own"       # Output directory for .pkl files
-TRAIN_RATIO = 0.8            # 80% of frames used for training
+OUT_DIR    = "dataset_own"  # Output directory for .pkl files
 
 # ── Load JSON ─────────────────────────────────────────────────────────────────
 with open(ROBOT_FILE) as f:
@@ -105,33 +104,23 @@ def make_items(frame_start: int, frame_end: int) -> list:
             ))
     return items
 
-# ── Train / test split on frames ─────────────────────────────────────────────
-split_frame = int(n_frames * TRAIN_RATIO)
+all_items = make_items(0, n_frames)
 
-train_items = make_items(0, split_frame)
-test_items  = make_items(split_frame, n_frames)
-
-print(f"Train frames : 0-{split_frame-1}  ->  {len(train_items)} trajectory items")
-print(f"Test  frames : {split_frame}-{n_frames-1}  ->  {len(test_items)} trajectory items")
+print(f"Frames : 0-{n_frames-1}  ->  {len(all_items)} trajectory items")
 
 # ── Save ──────────────────────────────────────────────────────────────────────
 os.makedirs(OUT_DIR, exist_ok=True)
 
-train_path = os.path.join(OUT_DIR, "twoPeople_train.pkl")
-test_path  = os.path.join(OUT_DIR, "twoPeople_test.pkl")
-
-with open(train_path, "wb") as f:
-    pickle.dump(train_items, f)
+test_path = os.path.join(OUT_DIR, "twoPeople_test.pkl")
 
 with open(test_path, "wb") as f:
-    pickle.dump(test_items, f)
+    pickle.dump(all_items, f)
 
-print(f"\nSaved: {train_path}")
-print(f"Saved: {test_path}")
+print(f"\nSaved: {test_path}")
 
 # ── Quick sanity check ────────────────────────────────────────────────────────
-print("\n-- Sanity check (first train item) --")
-h, fut, nbr = train_items[0]
+print("\n-- Sanity check (first item) --")
+h, fut, nbr = all_items[0]
 print(f"  hist     shape : {h.shape}   dtype: {h.dtype}")
 print(f"  future   shape : {fut.shape}  dtype: {fut.dtype}")
 print(f"  neighbor shape : {nbr.shape}  dtype: {nbr.dtype}")
