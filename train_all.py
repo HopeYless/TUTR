@@ -158,8 +158,14 @@ def train_epoch(model, optimizer, loader, motion_modes):
             soft_label, closest_mode_indices = get_cls_label(gt, motion_modes)
 
         optimizer.zero_grad()
-        pred_traj, scores = model(ped_obs, neis_obs, motion_modes, mask, closest_mode_indices)
-        reg_loss = reg_criterion(pred_traj, gt.reshape(pred_traj.shape))
+        pred_trajs, scores = model(ped_obs, neis_obs, motion_modes, mask, closest_mode_indices)
+        # pred_trajs: [B, num_train_k, pred_len*2]
+        # Pick the prediction closest to GT for the regression loss (best-of-k)
+        reg_label = gt.reshape(gt.shape[0], -1)                                         # [B, pred_len*2]
+        distances = torch.norm(pred_trajs - reg_label.unsqueeze(1), dim=-1)             # [B, num_train_k]
+        best_idx = distances.argmin(dim=-1)                                             # [B]
+        best_pred = pred_trajs[torch.arange(pred_trajs.shape[0]).cuda(), best_idx]      # [B, pred_len*2]
+        reg_loss = reg_criterion(best_pred, reg_label)
         clf_loss = cls_criterion(scores.squeeze(), soft_label)
         loss = reg_loss + clf_loss
         loss.backward()
